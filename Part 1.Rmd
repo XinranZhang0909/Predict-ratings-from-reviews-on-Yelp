@@ -1,0 +1,482 @@
+---
+title: "Predict Ratings From Reviews on Yelp"
+author: "Xinran Zhang"
+output:
+  html_document:
+    code_folding: show
+    highlight: haddock
+    number_sections: yes
+    theme: lumen
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+  pdf_document:
+    number_sections: yes
+    toc: yes
+    toc_depth: '4'
+urlcolor: blue
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, results = "hide", fig.width=8, fig.height=4)
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(dplyr, ggplot2, tm, SnowballC, RColorBrewer, wordcloud, glmnet,
+               randomForest, ranger, data.table)
+```
+\pagebreak
+
+Founded in 2004, [Yelp](https://www.yelp.com) is a platform that holds reviews for services including restaurants, salons, movers, cleaners and so on. Based on the reviews and ratings, we make choices of restaurants, movies, doctors. In this project, using reviews written in 2014 and a small piece of the reviews (100,000 out of 1 million) we try to answer the following questions:
+
+Goal: How are reviews related to ratings? How well can we predict star rankings based on the text of reviews?   
+  
+
+# Exploratory Data Analysis (EDA)
+
+## Read data
+
+```{r results='hold'}
+#data.all <- read.csv("yelp_subset.csv", as.is=TRUE) # as.is = T to keep the texts as character
+data.all <- fread("data/yelp_subset.csv", stringsAsFactors = FALSE)
+dim(data.all) # 100,000 documents  # length(unique(data.all$user_id))/dim(data.all)[1] 
+object.size(data.all) # about 92mb 
+```
+
+Let's first take a small piece of it to work through.
+
+```{r results= 'hold'}
+# taking a subset of yelp data
+# We could use fread with a specified nrows. We might need to shuffle the data in order to
+# get a random sample.
+data <- fread("data/yelp_subset.csv", nrows = 1000, stringsAsFactors = FALSE)
+data <- data.all[1:1000, ] # Take a small set to work through
+        # MAKE SURE: you will rerun the analyses later by
+        # setting back a larger dataset.
+names(data)
+str(data)   
+#length(unique(data$user_id)) #someone wrote more than one revews
+#length(unique(data$review_id)) # unique one for each review
+n <- nrow(data)
+levels(as.factor(data$stars))
+```
+
+## Response
+
+We create a new response `rating` such that a review will be `good` or `1` if the original rating is at least 4 or 5. Otherwise we will code it as a `bad` or `0`. 
+Stars or ratings are turn to a good/bad rating. We also set `rating` as a categorical variable.   
+
+```{r}
+data$rating <- c(0)
+data$rating[data$stars >= 4] <- 1
+data$rating <- as.factor(data$rating)
+summary(data) #str(data)
+```
+
+**Proportion of good ratings**:
+
+```{r results='hold'}
+prop.table(table(data$rating))
+```
+Notice that $60\%$ of the reviews are good ones.
+
+## Date
+
+**Does rating relate to month or day of the weeks?**
+
+Dealing with `date` can be a challenging job. Should we treat them as continuous variables or categorical ones? This highly depends on the context and the goal of the study. In our situation it makes sense that we are interested in knowing if people tend to leave reviews over the weekend. Also, would a review left on the weekend tends to be a better one?
+
+Let us use functions in `tidyverse` to  format the dates and extract weekdays
+```{r}
+weekdays <- weekdays(as.Date(data$date)) # get weekdays for each review  
+months <- months(as.Date(data$date))   # get months 
+```
+
+Do people tend to leave a review over weekends? (months?)
+```{r results='hold'}
+par(mfrow=c(1,2))
+pie(table(weekdays), main="Prop of reviews") # Pretty much evenly distributed
+pie(table(months))  
+```
+
+Proportion of Good reviews: Don't really see any pattern
+```{r results='hold'}
+prop.table(table(data$rating, weekdays), 2)  # prop of the columns
+prop.table(table(data$rating, weekdays), 1)  # prop of the rows
+```
+\pagebreak
+
+# Bag of words and term frequency
+
+We will turn a text into a vector of features, each of which represents the words that are used. The specific value of the feature for a given document tells us the frequency (how many occurrences) of that word in the document. 
+
+We do this by first collect all possible words (referred to as a library or bag of all words). We will then record frequency of each word used in the review/text. 
+
+## Word term frequency table
+
+Let's first take a look at the texts we have: 
+```{r}
+data1.text <- data$text   # take the text out
+length(data1.text)
+typeof(data1.text)
+
+print(data1.text[1:5]) # view a few documents
+```
+Notice number 4 and 5 are bit lengthy, which could indicate they like the place. We now extract text into word term frequency table.
+
+### Corpus
+
+```{r results='hold'}
+mycorpus1 <- VCorpus(VectorSource(data1.text))
+mycorpus1
+typeof(mycorpus1)   ## It is a list
+# inspect the first corpus
+inspect(mycorpus1[[1]])
+# or use `as.character` to extract the text
+as.character(mycorpus1[[1]])
+```
+
+Inspect the corpus, say documents number 4 and 5.
+```{r}
+## inspect corpus 4
+# as.character(mycorpus1[4]) 
+## make it more manageable to read
+# strwrap(as.character(mycorpus1[4])) 
+lapply(mycorpus1[4:5], as.character)  # inspect corpus 4:5
+# lapply(mycorpus1[4:5], inspect)  # inspect corpus 4:5
+```
+
+
+### Data cleaning
+
+We transform the text into a more standard format and clean the text by removing punctuation, numbers and some common words that do not have predictive power (e.g. pronouns, prepositions, conjunctions). 
+
+```{r results=TRUE}
+# Converts all words to lowercase
+mycorpus_clean <- tm_map(mycorpus1, content_transformer(tolower))
+
+# Removes common English stopwords (e.g. "with", "i")
+mycorpus_clean <- tm_map(mycorpus_clean, removeWords, stopwords("english"))
+
+# Removes any punctuation
+# NOTE: This step may not be appropriate if you want to account for differences
+#       on semantics depending on which sentence a word belongs to if you end up
+#       using n-grams or k-skip-n-grams.
+#       Instead, periods (or semicolons, etc.) can be replaced with a unique
+#       token (e.g. "[PERIOD]") that retains this semantic meaning.
+mycorpus_clean <- tm_map(mycorpus_clean, removePunctuation)
+
+# Removes numbers
+mycorpus_clean <- tm_map(mycorpus_clean, removeNumbers)
+
+# Stem words
+mycorpus_clean <- tm_map(mycorpus_clean, stemDocument, lazy = TRUE)   
+
+lapply(mycorpus_clean[4:5], as.character)
+```
+
+
+
+### Word frequency matrix
+
+Now we transform each review into a word frequency matrix. 
+
+```{r results=TRUE}
+dtm1 <- DocumentTermMatrix( mycorpus_clean )   ## library = collection of words for all documents
+class(dtm1)
+inspect(dtm1) # typeof(dtm1)  #length(dimnames(dtm1)$Terms)
+```
+
+
+```{r}
+colnames(dtm1)[7150:7161] # the last a few words in the bag
+# another way to get list of words
+# dimnames(dtm1)$Terms[7000:7161]
+dim(as.matrix(dtm1))  # we use 7161 words as predictors
+```
+
+Document 1, which is row1 in the dtm.
+```{r}
+inspect(dtm1[1,])  #Non-/sparse entries: number of non-zero entries vs. number of zero entries
+``` 
+It has 25 distinctive words; in other words, there 25 non-zero cells out of 7161 bag of words.
+```{r}
+as.matrix(dtm1[1, 1:50])  # most of the cells are 0
+``` 
+This is because review 1 only consists of 28 words after all the cleansing.
+```{r}
+sum(as.matrix(dtm1[1,]))
+``` 
+
+### Reduce the size of the bag
+
+We first cut the bag to only include the words appearing at least 1% of the time. This reduces the dimension of the features extracted to be analyzed. 
+```{r}
+threshold <- .01*length(mycorpus_clean)   # 1% of the total documents 
+words.10 <- findFreqTerms(dtm1, lowfreq=threshold)  # words appearing at least among 1% of the documents
+length(words.10)
+words.10[580:600]
+```
+
+
+```{r}
+dtm.10<- DocumentTermMatrix(mycorpus_clean, control = list(dictionary = words.10))  
+dim(as.matrix(dtm.10))
+colnames(dtm.10)[40:50]
+```
+
+
+### Get `DTM`
+
+```{r DTM, results= TRUE}
+# Turn texts to corpus
+mycorpus1  <- VCorpus(VectorSource(data1.text))
+
+
+# Control list for creating our DTM within DocumentTermMatrix
+# Can tweak settings based off if you want punctuation, numbers, etc.
+control_list <- list( tolower = TRUE, 
+                      removePunctuation = TRUE,
+                      removeNumbers = TRUE, 
+                      stopwords = stopwords("english"), 
+                      stemming = TRUE)
+# dtm with all terms:
+dtm.10.long  <- DocumentTermMatrix(mycorpus1, control = control_list)
+#inspect(dtm.10.long)
+
+# kick out rare words 
+dtm.10<- removeSparseTerms(dtm.10.long, 1-.01)  
+inspect(dtm.10)
+
+# look at the document 1 before and after cleaning
+# inspect(mycorpus1[[1]])
+# after cleaning
+# colnames(as.matrix(dtm1[1, ]))[which(as.matrix(dtm1[1, ]) != 0)]
+```
+
+# Analyses
+
+We will use logistic regression models and LASSO to explore the relationship between `ratings` and `text`. 
+
+## Splitting data
+
+Let's first read in the processed data with text being a vector. 
+```{r}
+data2 <- fread("data/YELP_tm_freq.csv")  #dim(data2)
+names(data2)[1:20] # notice that user_id, stars and date are in the data2
+dim(data2)
+data2$rating <- as.factor(data2$rating)
+table(data2$rating)
+#str(data2)  object.size(data2)  435Mb!!!
+```
+
+We first split data into two sets one training data and the other testing data. We use training data to build models, choose models etc and make final recommendations. We then report the performance using the testing data.
+
+Reserve 10000 randomly chosen rows as our test data (`data2.test`) and the remaining 90000 as the training data (`data2.train`)
+```{r}
+set.seed(1)  # for the purpose of reporducibility
+n <- nrow(data2)
+test.index <- sample(n, 10000)
+# length(test.index)
+data2.test <- data2[test.index, -c(1:3)] # only keep rating and the texts
+data2.train <- data2[-test.index, -c(1:3)]
+dim(data2.train)
+```
+
+## Analysis 1: LASSO
+
+We first explore a logistic regression model using LASSO. The following R-chunk runs a LASSO model with $\alpha=.99$. The reason we take an elastic net is to enjoy the nice properties from both `LASSO` (impose sparsity) and `Ridge` (computationally stable). 
+
+```{r, eval=FALSE}
+### or try `sparse.model.matrix()` which is much faster
+y <- data2.train$rating
+X1 <- sparse.model.matrix(rating~., data=data2.train)[, -1]
+set.seed(2)
+result.lasso <- cv.glmnet(X1, y, alpha=.99, family="binomial")
+# 1.25 minutes in my MAC
+plot(result.lasso)
+# this this may take you long time to run, we save result.lasso
+saveRDS(result.lasso, file="data/TextMining_lasso.RDS")
+# result.lasso can be assigned back by 
+# result.lasso <- readRDS("data/TextMining_lasso.RDS")
+
+# number of non-zero words picked up by LASSO when using lambda.1se
+coef.1se <- coef(result.lasso, s="lambda.1se")  
+lasso.words <- coef.1se@Dimnames[[1]] [coef.1se@i][-1] # non-zero variables without intercept. 
+summary(lasso.words)
+
+
+# or our old way
+coef.1se <- coef(result.lasso, s="lambda.1se")  
+coef.1se <- coef.1se[which(coef.1se !=0),] 
+lasso.words <- rownames(as.matrix(coef.1se))[-1]
+summary(lasso.words)
+
+
+
+### cv.glmnt with the non-sparse design matrix takes much longer
+# X <- as.matrix(data2.train[, -1]) # we can use as.matrix directly her
+#### Be careful to run the following LASSO.
+#set.seed(2)
+#result.lasso <- cv.glmnet(X, y, alpha=.99, family="binomial")  
+# 10 minutes in my MAC
+#plot(result.lasso)
+
+
+```
+
+Because of the computational burden, I have saved the LASSO results and other results into `TextMining_lasso.RDS` and  `TextMining_glm.RDS`.
+
+We resume our analyses by loading the `LASSO` results here. We extract useful variables using `lambda.1se`
+
+```{r results=TRUE}
+result.lasso <- readRDS("data/TextMining_lasso.RDS")
+plot(result.lasso)
+coef.1se <- coef(result.lasso, s="lambda.1se")  
+coef.1se <- coef.1se[which(coef.1se !=0),] 
+lasso.words <- rownames(as.matrix(coef.1se))[-1]
+summary(lasso.words)
+
+```
+
+## Analysis 2: Relaxed LASSO 
+
+As an alternative model we will run our relaxed `LASSO`. Input variables are chosen by `LASSO` and we get a regular logistic regression model. Once again it is stored as `result.glm` in `TextMining.RData`. 
+
+```{r relax lasso, eval=FALSE}
+sel_cols <- c("rating", lasso.words)
+# use all_of() to specify we would like to select variables in sel_cols
+data_sub <- data2.train %>% select(all_of(sel_cols))
+result.glm <- glm(rating~., family=binomial, data_sub) # takes 3.5 minutes
+## glm() returns a big object with unnecessary information
+# saveRDS(result.glm, 
+#      file = "data/TextMining_glm.RDS")
+
+stripGlmLR = function(cm) {
+  cm$y = c()
+  cm$model = c()
+  
+  cm$residuals = c()
+  cm$fitted.values = c()
+  cm$effects = c()
+  cm$qr$qr = c()  
+  cm$linear.predictors = c()
+  cm$weights = c()
+  cm$prior.weights = c()
+  cm$data = c()
+
+  
+  cm$family$variance = c()
+  cm$family$dev.resids = c()
+  cm$family$aic = c()
+  cm$family$validmu = c()
+  cm$family$simulate = c()
+  attr(cm$terms,".Environment") = c()
+  attr(cm$formula,".Environment") = c()
+  
+  cm
+}
+
+result.glm.small <- stripGlmLR(result.glm)
+
+saveRDS(result.glm.small, 
+     file = "data/TextMining_glm_small.RDS")
+```
+
+## Analysis 3: Word cloud! (Sentiment analysis)
+
+TIME TO PLOT A WORD CLOUD!! The size of the words are prop to the logistic reg coef's
+
+**Positive word cloud**:
+
+```{r, warning=FALSE}
+result.glm <- readRDS("data/TextMining_glm_small.RDS")
+result.glm.coef <- coef(result.glm)
+result.glm.coef[200:250]
+hist(result.glm.coef)
+
+# pick up the positive coef's which are positively related to the prob of being a good review
+good.glm <- result.glm.coef[which(result.glm.coef > 0)]
+good.glm <- good.glm[-1]  # took intercept out
+names(good.glm)[1:20]  # which words are positively associated with good ratings
+
+good.fre <- sort(good.glm, decreasing = TRUE) # sort the coef's
+round(good.fre, 4)[1:20] # leading 20 positive words, amazing!
+length(good.fre)  # 390 good words
+
+# hist(as.matrix(good.fre), breaks=30, col="red") 
+good.word <- names(good.fre)  # good words with a decreasing order in the coeff's
+
+```
+
+```{r results=TRUE, warning=FALSE, message=FALSE}
+cor.special <- brewer.pal(8,"Dark2")  # set up a pretty color scheme
+wordcloud(good.word[1:300], good.fre[1:300],  # make a word cloud
+          colors=cor.special, ordered.colors=F)
+```
+
+**Negative word cloud**:
+
+```{r, message=FALSE, warning=FALSE, results= TRUE}
+bad.glm <- result.glm.coef[which(result.glm.coef < 0)]
+# names(bad.glm)[1:50]
+
+cor.special <- brewer.pal(6,"Dark2")
+bad.fre <- sort(-bad.glm, decreasing = TRUE)
+round(bad.fre, 4)[1:40]
+
+# hist(as.matrix(bad.fre), breaks=30, col="green")
+bad.word <- names(bad.fre)
+wordcloud(bad.word[1:300], bad.fre[1:300], 
+          color=cor.special, ordered.colors=F)
+```
+
+**Put two clouds together**:
+
+```{r, message=FALSE, warning=FALSE, results= TRUE}
+par(mfrow=c(1,2))
+cor.special <- brewer.pal(8,"Dark2") 
+wordcloud(good.word[1:300], good.fre[1:300], 
+          colors=cor.special, ordered.colors=F)
+wordcloud(bad.word[1:300], bad.fre[1:300], 
+          color="darkgreen", ordered.colors=F)
+par(mfrow=c(1,1))
+```
+
+## Analysis 4: Predictions
+
+We have obtained two sets of models one from `LASSO` the other from `relaxed LASSO`. To compare the performance as classifiers we will evaluate their `mis-classification error` and/or `ROC` curves using `testing data`.
+
+### 1) How does glm do in terms of classification?
+
+Use the testing data we get mis-classification errors for one rule: majority vote. 
+```{r results= 'hold'}
+predict.glm <- predict(result.glm, data2.test, type = "response")
+class.glm <- ifelse(predict.glm > .5, "1", "0")
+# length(class.glm)
+
+testerror.glm <- mean(data2.test$rating != class.glm)
+testerror.glm   # mis classification error is 0.19
+
+pROC::roc(data2.test$rating, predict.glm, plot=T) # AUC=.87!!!!
+```
+
+
+### 2) LASSO model using `lambda.1se`
+
+Once again we evaluate the testing performance of `LASSO` solution. 
+```{r results= 'hold'}
+predict.lasso.p <- predict(result.lasso, as.matrix(data2.test[, -1]), type = "response", s="lambda.1se")
+  # output lasso estimates of prob's
+predict.lasso <- predict(result.lasso, as.matrix(data2.test[, -1]), type = "class", s="lambda.1se")
+  # output majority vote labels
+
+# LASSO testing errors
+mean(data2.test$rating != predict.lasso)   # .19
+
+# ROC curve for LASSO estimates
+
+pROC::roc(data2.test$rating, predict.lasso.p, plot=TRUE)
+
+```
+
+Comparing the two predictions through testing errors/ROC we do not see much of the difference. We could use either final models for the purpose of the prediction. 
